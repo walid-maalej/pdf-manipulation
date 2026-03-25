@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 PyPDF2
 pikepdf
+python-multipart

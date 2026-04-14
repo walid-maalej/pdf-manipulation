@@ -4,7 +4,7 @@ import tempfile, shutil, os, json, io
 from PyPDF2 import PdfReader, PdfWriter
 import pikepdf
 from PIL import Image
-import fitz  # pymupdf
+from pdf2image import convert_from_path
 
 app = FastAPI()
 
@@ -67,16 +67,11 @@ def process_pdf_segment(reader: PdfReader, start: int, end: int) -> str:
 
 
 def convert_pdf_page_to_png(pdf_path: str, page_index: int) -> str:
-    """Render a single-page PDF to a PNG tempfile using PyMuPDF at 300 DPI."""
+    """Render a single-page PDF to a PNG tempfile using pdf2image/poppler at 300 DPI."""
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     temp.close()
-    doc = fitz.open(pdf_path)
-    page = doc.load_page(page_index)
-    # 300 DPI — matrix scale factor: 300/72 ≈ 4.167
-    mat = fitz.Matrix(300 / 72, 300 / 72)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    pix.save(temp.name)
-    doc.close()
+    images = convert_from_path(pdf_path, dpi=300, first_page=page_index + 1, last_page=page_index + 1)
+    images[0].save(temp.name, format="PNG")
     return temp.name
 
 

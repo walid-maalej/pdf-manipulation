@@ -4,6 +4,7 @@ import tempfile, shutil, os, json, io
 from PyPDF2 import PdfReader, PdfWriter
 import pikepdf
 from PIL import Image
+import fitz  # pymupdf
 
 app = FastAPI()
 
@@ -65,30 +66,18 @@ def process_pdf_segment(reader: PdfReader, start: int, end: int) -> str:
         return raw_temp
 
 
-def extract_package_name(filename: str) -> str | None:
-    stem = filename.removesuffix(".pdf")
-    parts = stem.split("__")
-    if len(parts) >= 3:
-        return parts[0]
-    return None
-
-
-def merge_pdfs_to_tempfile(pdf_paths: list[str]) -> str:
-    writer = PdfWriter()
-    for path in pdf_paths:
-        with open(path, "rb") as f:
-            reader = PdfReader(f)
-            for page in reader.pages:
-                writer.add_page(page)
-    raw_temp = write_writer_to_tempfile(writer)
-    try:
-        compressed_path = compress_pdf_to_tempfile(raw_temp)
-        if compressed_path:
-            os.unlink(raw_temp)
-            return compressed_path
-        return raw_temp
-    except Exception:
-        return raw_temp
+def convert_pdf_page_to_png(pdf_path: str, page_index: int) -> str:
+    """Render a single-page PDF to a PNG tempfile using PyMuPDF at 300 DPI."""
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    temp.close()
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(page_index)
+    # 300 DPI — matrix scale factor: 300/72 ≈ 4.167
+    mat = fitz.Matrix(300 / 72, 300 / 72)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    pix.save(temp.name)
+    doc.close()
+    return temp.name
 
 
 def normalize_to_pdf(upload_path: str, original_filename: str) -> tuple[str, list[str]]:
@@ -99,7 +88,7 @@ def normalize_to_pdf(upload_path: str, original_filename: str) -> tuple[str, lis
     return upload_path, []
 
 
-def multipart_stream(files: list[tuple[str, str]]):
+def multipart_stream(files: list[tuple[str, str]], content_type: str = "application/pdf"):
     """
     Yields a multipart/form-data stream.
     files: list of (filename, filepath) tuples.
@@ -112,7 +101,7 @@ def multipart_stream(files: list[tuple[str, str]]):
         header = (
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-            f"Content-Type: application/pdf\r\n"
+            f"Content-Type: {content_type}\r\n"
             f"Content-Length: {file_size}\r\n"
             f"\r\n"
         )
@@ -146,8 +135,6 @@ async def split_pdf(file: UploadFile = File(...), config_json: str = Form(...)):
         pdf_path, extra_temps = normalize_to_pdf(input_path, original_filename)
         temp_files_to_clean.extend(extra_temps)
 
-        package_segments: dict[str, list[tuple[int, str]]] = {}
-
         with open(pdf_path, "rb") as f_in:
             reader = PdfReader(f_in)
             total_pages = len(reader.pages)
@@ -163,22 +150,6 @@ async def split_pdf(file: UploadFile = File(...), config_json: str = Form(...)):
                 segment_path = process_pdf_segment(reader, start, end)
                 temp_files_to_clean.append(segment_path)
                 output_files.append((filename, segment_path))
-
-                package = extract_package_name(filename)
-                if package:
-                    stem_parts = filename.removesuffix(".pdf").split("__")
-                    try:
-                        ordre = int(stem_parts[1])
-                    except (IndexError, ValueError):
-                        ordre = 0
-                    package_segments.setdefault(package, []).append((ordre, segment_path))
-
-        for package, segments in package_segments.items():
-            segments.sort(key=lambda x: x[0])
-            ordered_paths = [path for _, path in segments]
-            merged_path = merge_pdfs_to_tempfile(ordered_paths)
-            temp_files_to_clean.append(merged_path)
-            output_files.append((f"{package}.pdf", merged_path))
 
         boundary = "----PDFBoundary"
 
@@ -227,13 +198,17 @@ async def split_page_page(file: UploadFile = File(...)):
             total_pages = len(reader.pages)
 
             for i in range(total_pages):
+                # Write the single page to a temp PDF, then render it to PNG
                 segment_path = process_pdf_segment(reader, i, i + 1)
                 temp_files_to_clean.append(segment_path)
-                output_files.append((f"page_{i + 1}.pdf", segment_path))
+
+                png_path = convert_pdf_page_to_png(segment_path, 0)
+                temp_files_to_clean.append(png_path)
+                output_files.append((f"page_{i + 1}.png", png_path))
 
         def cleanup_and_stream():
             try:
-                yield from multipart_stream(output_files)
+                yield from multipart_stream(output_files, content_type="image/png")
             finally:
                 os.unlink(input_path)
                 for path in temp_files_to_clean:

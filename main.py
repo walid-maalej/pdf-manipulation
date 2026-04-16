@@ -123,3 +123,57 @@ async def split_page_page(file: UploadFile = File(...)):
         os.unlink(temp_input.name)
 
     return JSONResponse(content=result_files)
+
+
+from pydantic import BaseModel
+from typing import List
+
+class DocumentItem(BaseModel):
+    name: str
+    data: str  # base64-encoded PDF
+
+class MergePackage(BaseModel):
+    package_name: str
+    documents: List[DocumentItem]
+
+
+@app.post("/merge-files")
+async def merge_files(payload: MergePackage):
+    writer = PdfWriter()
+
+    for doc in payload.documents:
+        try:
+            raw_bytes = base64.b64decode(doc.data)
+            reader = PdfReader(io.BytesIO(raw_bytes))
+            for page in reader.pages:
+                writer.add_page(page)
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Failed to process '{doc.name}': {str(e)}"}
+            )
+
+    # Write merged PDF to buffer
+    merged_buffer = io.BytesIO()
+    writer.write(merged_buffer)
+    merged_buffer.seek(0)
+
+    # Optional: compress with pikepdf
+    try:
+        compressed_buffer = io.BytesIO()
+        with pikepdf.open(merged_buffer) as pdf:
+            pdf.save(compressed_buffer)
+        compressed_buffer.seek(0)
+        final_bytes = compressed_buffer.read()
+    except Exception as e:
+        print(f"pikepdf compression failed: {e}, using raw bytes")
+        merged_buffer.seek(0)
+        final_bytes = merged_buffer.read()
+
+    encoded = base64.b64encode(final_bytes).decode("utf-8")
+
+    return JSONResponse(content={
+        "package_name": payload.package_name,
+        "filename": f"{payload.package_name}.pdf",
+        "data": encoded
+    })

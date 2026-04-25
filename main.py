@@ -176,14 +176,7 @@ async def split_page_page(file: UploadFile = File(...)):
                 })
 
         elif filename.endswith(IMAGE_EXTENSIONS):
-            try:
-                pdf_bytes = image_to_pdf_bytes(raw)
-            except Exception as e:
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": f"Image conversion failed: {str(e)}"}
-                )
-
+            pdf_bytes = image_to_pdf_bytes(raw)
             stem = filename.rsplit(".", 1)[0]
             encoded = base64.b64encode(pdf_bytes).decode("utf-8")
             result_files.append({

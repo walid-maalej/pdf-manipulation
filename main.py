@@ -60,31 +60,43 @@ def read_upload(file: UploadFile) -> bytes:
 
 def image_to_pdf_bytes(raw: bytes) -> bytes:
     image = Image.open(io.BytesIO(raw))
+    fmt = image.format  # original format: JPEG, PNG, BMP, WEBP, TIFF, etc.
 
-    # For formats img2pdf can handle directly (JPEG, PNG in RGB/L), pass raw bytes
-    # For problematic modes, normalize via Pillow first
-    if image.mode in ("RGBA", "P", "LA"):
+    # Formats img2pdf can handle natively without re-encoding
+    NATIVE_FORMATS = {"JPEG", "PNG"}
+
+    if fmt in NATIVE_FORMATS and image.mode in ("RGB", "L", "RGBA"):
+        if image.mode == "RGBA":
+            # img2pdf doesn't support RGBA even in PNG — flatten to RGB
+            background = Image.new("RGB", image.size, (255, 255, 255))
+            background.paste(image, mask=image.split()[3])
+            image = background
+            img_buffer = io.BytesIO()
+            image.save(img_buffer, format="PNG")
+            img_buffer.seek(0)
+            return img2pdf.convert(img_buffer.getvalue())
+        # Pass raw bytes directly — lossless, no re-encoding
+        return img2pdf.convert(raw)
+
+    # Everything else (BMP, WEBP, TIFF, palette, CMYK, etc.) — convert via Pillow
+    if image.mode in ("RGBA", "LA", "P"):
         background = Image.new("RGB", image.size, (255, 255, 255))
         if image.mode == "P":
             image = image.convert("RGBA")
-        background.paste(image, mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None)
+        mask = image.split()[-1] if image.mode in ("RGBA", "LA") else None
+        background.paste(image, mask=mask)
         image = background
-
-        img_buffer = io.BytesIO()
-        image.save(img_buffer, format="PNG")
-        img_buffer.seek(0)
-        return img2pdf.convert(img_buffer.getvalue())
-
-    elif image.mode not in ("RGB", "L", "RGBA"):
+    elif image.mode == "CMYK":
         image = image.convert("RGB")
-        img_buffer = io.BytesIO()
-        image.save(img_buffer, format="JPEG")
-        img_buffer.seek(0)
-        return img2pdf.convert(img_buffer.getvalue())
+    elif image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
 
-    else:
-        # Pass original bytes directly — img2pdf handles JPEG/PNG natively without re-encoding
-        return img2pdf.convert(raw)
+    img_buffer = io.BytesIO()
+    save_fmt = "PNG" if image.mode == "L" else "JPEG"
+    image.save(img_buffer, format=save_fmt, quality=95)
+    img_buffer.seek(0)
+    return img2pdf.convert(img_buffer.getvalue())
+
 
 
 @app.post("/split-pdf")
@@ -133,16 +145,17 @@ async def split_pdf(file: UploadFile = File(...), config_json: str = Form(...)):
     return JSONResponse(content={"files": result_files})
 
 
+
 @app.post("/split-page-page")
 async def split_page_page(file: UploadFile = File(...)):
     filename = file.filename.lower()
     result_files = []
-
     raw = read_upload(file)
+
+    IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".gif")
 
     try:
         if filename.endswith(".pdf"):
-            # Only call normalize_pdf_bytes for actual PDFs
             normalized = normalize_pdf_bytes(raw)
             reader = open_pdf_reader(normalized)
             total_pages = len(reader.pages)
@@ -157,25 +170,32 @@ async def split_page_page(file: UploadFile = File(...)):
 
                 final_bytes = compress_with_pikepdf(pdf_buffer.read())
                 encoded = base64.b64encode(final_bytes).decode("utf-8")
-
                 result_files.append({
                     "filename": f"page_{i+1}.pdf",
                     "data": encoded
                 })
 
-        elif filename.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")):
-            pdf_bytes = image_to_pdf_bytes(raw)
-            # Don't run compress_with_pikepdf here — pikepdf can't parse image bytes
-            encoded = base64.b64encode(pdf_bytes).decode("utf-8")
-            stem = filename.rsplit(".", 1)[0]
+        elif filename.endswith(IMAGE_EXTENSIONS):
+            try:
+                pdf_bytes = image_to_pdf_bytes(raw)
+            except Exception as e:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Image conversion failed: {str(e)}"}
+                )
 
+            stem = filename.rsplit(".", 1)[0]
+            encoded = base64.b64encode(pdf_bytes).decode("utf-8")
             result_files.append({
                 "filename": f"{stem}.pdf",
                 "data": encoded
             })
 
         else:
-            return JSONResponse(content={"error": "Unsupported file type"}, status_code=400)
+            return JSONResponse(
+                content={"error": f"Unsupported file type: {filename.rsplit('.', 1)[-1]}"},
+                status_code=400
+            )
 
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})

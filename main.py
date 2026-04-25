@@ -54,21 +54,30 @@ def read_upload(file: UploadFile) -> bytes:
 def image_to_pdf_bytes(raw: bytes) -> bytes:
     image = Image.open(io.BytesIO(raw))
 
+    # For formats img2pdf can handle directly (JPEG, PNG in RGB/L), pass raw bytes
+    # For problematic modes, normalize via Pillow first
     if image.mode in ("RGBA", "P", "LA"):
         background = Image.new("RGB", image.size, (255, 255, 255))
         if image.mode == "P":
             image = image.convert("RGBA")
         background.paste(image, mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None)
         image = background
-    elif image.mode not in ("RGB", "L"):
+
+        img_buffer = io.BytesIO()
+        image.save(img_buffer, format="PNG")
+        img_buffer.seek(0)
+        return img2pdf.convert(img_buffer.getvalue())
+
+    elif image.mode not in ("RGB", "L", "RGBA"):
         image = image.convert("RGB")
+        img_buffer = io.BytesIO()
+        image.save(img_buffer, format="JPEG")
+        img_buffer.seek(0)
+        return img2pdf.convert(img_buffer.getvalue())
 
-    img_buffer = io.BytesIO()
-    fmt = "JPEG" if image.mode == "RGB" else "PNG"
-    image.save(img_buffer, format=fmt)
-    img_buffer.seek(0)
-
-    return img2pdf.convert(img_buffer.getvalue())
+    else:
+        # Pass original bytes directly — img2pdf handles JPEG/PNG natively without re-encoding
+        return img2pdf.convert(raw)
 
 
 @app.post("/split-pdf")
@@ -126,6 +135,7 @@ async def split_page_page(file: UploadFile = File(...)):
 
     try:
         if filename.endswith(".pdf"):
+            # Only call normalize_pdf_bytes for actual PDFs
             normalized = normalize_pdf_bytes(raw)
             reader = open_pdf_reader(normalized)
             total_pages = len(reader.pages)
@@ -148,9 +158,9 @@ async def split_page_page(file: UploadFile = File(...)):
 
         elif filename.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")):
             pdf_bytes = image_to_pdf_bytes(raw)
-            final_bytes = compress_with_pikepdf(pdf_bytes)
+            # Don't run compress_with_pikepdf here — pikepdf can't parse image bytes
+            encoded = base64.b64encode(pdf_bytes).decode("utf-8")
             stem = filename.rsplit(".", 1)[0]
-            encoded = base64.b64encode(final_bytes).decode("utf-8")
 
             result_files.append({
                 "filename": f"{stem}.pdf",
@@ -166,6 +176,7 @@ async def split_page_page(file: UploadFile = File(...)):
         return JSONResponse(status_code=500, content={"error": f"Processing failed: {str(e)}"})
 
     return JSONResponse(content=result_files)
+
 
 
 class DocumentItem(BaseModel):

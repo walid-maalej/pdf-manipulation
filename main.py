@@ -23,7 +23,6 @@ def open_pdf_reader(data: bytes) -> PdfReader:
     return reader
 
 def compress_with_pikepdf(raw_bytes: bytes) -> bytes:
-    # Guard: only attempt if bytes start with PDF magic bytes
     if not raw_bytes.startswith(b"%PDF"):
         print("compress_with_pikepdf skipped: not a PDF")
         return raw_bytes
@@ -39,7 +38,6 @@ def compress_with_pikepdf(raw_bytes: bytes) -> bytes:
 
 
 def normalize_pdf_bytes(raw_bytes: bytes) -> bytes:
-    # Guard: only attempt if bytes start with PDF magic bytes
     if not raw_bytes.startswith(b"%PDF"):
         print("normalize_pdf_bytes skipped: not a PDF")
         return raw_bytes
@@ -60,14 +58,12 @@ def read_upload(file: UploadFile) -> bytes:
 
 def image_to_pdf_bytes(raw: bytes) -> bytes:
     image = Image.open(io.BytesIO(raw))
-    fmt = image.format  # original format: JPEG, PNG, BMP, WEBP, TIFF, etc.
+    fmt = image.format
 
-    # Formats img2pdf can handle natively without re-encoding
     NATIVE_FORMATS = {"JPEG", "PNG"}
 
     if fmt in NATIVE_FORMATS and image.mode in ("RGB", "L", "RGBA"):
         if image.mode == "RGBA":
-            # img2pdf doesn't support RGBA even in PNG — flatten to RGB
             background = Image.new("RGB", image.size, (255, 255, 255))
             background.paste(image, mask=image.split()[3])
             image = background
@@ -75,10 +71,8 @@ def image_to_pdf_bytes(raw: bytes) -> bytes:
             image.save(img_buffer, format="PNG")
             img_buffer.seek(0)
             return img2pdf.convert(img_buffer.getvalue())
-        # Pass raw bytes directly — lossless, no re-encoding
         return img2pdf.convert(raw)
 
-    # Everything else (BMP, WEBP, TIFF, palette, CMYK, etc.) — convert via Pillow
     if image.mode in ("RGBA", "LA", "P"):
         background = Image.new("RGB", image.size, (255, 255, 255))
         if image.mode == "P":
@@ -97,6 +91,30 @@ def image_to_pdf_bytes(raw: bytes) -> bytes:
     img_buffer.seek(0)
     return img2pdf.convert(img_buffer.getvalue())
 
+
+def detect_file_type(raw: bytes) -> str:
+    """Detect file type from magic bytes. Returns 'pdf', 'image', or 'unknown'."""
+    if raw[:4] == b"%PDF":
+        return "pdf"
+    # JPEG
+    if raw[:3] == b"\xff\xd8\xff":
+        return "image"
+    # PNG
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image"
+    # GIF
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "image"
+    # BMP
+    if raw[:2] == b"BM":
+        return "image"
+    # TIFF (little-endian or big-endian)
+    if raw[:4] in (b"II\x2a\x00", b"MM\x00\x2a"):
+        return "image"
+    # WEBP (RIFF....WEBP)
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image"
+    return "unknown"
 
 
 @app.post("/split-pdf")
@@ -148,14 +166,15 @@ async def split_pdf(file: UploadFile = File(...), config_json: str = Form(...)):
 
 @app.post("/split-page-page")
 async def split_page_page(file: UploadFile = File(...)):
-    filename = file.filename.lower()
+    filename = (file.filename or "upload").lower()
     result_files = []
     raw = read_upload(file)
 
-    IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".gif")
+    file_type = detect_file_type(raw)
+    print(f"split-page-page: filename={filename!r}, detected_type={file_type}, size={len(raw)}")
 
     try:
-        if filename.endswith(".pdf"):
+        if file_type == "pdf":
             normalized = normalize_pdf_bytes(raw)
             reader = open_pdf_reader(normalized)
             total_pages = len(reader.pages)
@@ -175,9 +194,9 @@ async def split_page_page(file: UploadFile = File(...)):
                     "data": encoded
                 })
 
-        elif filename.endswith(IMAGE_EXTENSIONS):
+        elif file_type == "image":
             pdf_bytes = image_to_pdf_bytes(raw)
-            stem = filename.rsplit(".", 1)[0]
+            stem = filename.rsplit(".", 1)[0] if "." in filename else filename
             encoded = base64.b64encode(pdf_bytes).decode("utf-8")
             result_files.append({
                 "filename": f"{stem}.pdf",
@@ -185,14 +204,27 @@ async def split_page_page(file: UploadFile = File(...)):
             })
 
         else:
-            return JSONResponse(
-                content={"error": f"Unsupported file type: {filename.rsplit('.', 1)[-1]}"},
-                status_code=400
-            )
+            # Last resort: fall back to filename extension
+            IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".gif")
+            if filename.endswith(IMAGE_EXTENSIONS):
+                pdf_bytes = image_to_pdf_bytes(raw)
+                stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+                encoded = base64.b64encode(pdf_bytes).decode("utf-8")
+                result_files.append({
+                    "filename": f"{stem}.pdf",
+                    "data": encoded
+                })
+            else:
+                ext = filename.rsplit(".", 1)[-1] if "." in filename else "unknown"
+                return JSONResponse(
+                    content={"error": f"Unsupported file type: {ext}"},
+                    status_code=400
+                )
 
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     except Exception as e:
+        print(f"split-page-page error: {type(e).__name__}: {e}")
         return JSONResponse(status_code=500, content={"error": f"Processing failed: {str(e)}"})
 
     return JSONResponse(content=result_files)

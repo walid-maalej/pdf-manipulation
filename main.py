@@ -22,20 +22,11 @@ def open_pdf_reader(data: bytes) -> PdfReader:
             raise ValueError(f"Cannot decrypt PDF: {e}")
     return reader
 
-
-def normalize_pdf_bytes(raw_bytes: bytes) -> bytes:
-    try:
-        buf = io.BytesIO()
-        with pikepdf.open(io.BytesIO(raw_bytes), allow_overwriting_input=False) as pdf:
-            pdf.save(buf, encryption=False)
-        buf.seek(0)
-        return buf.read()
-    except Exception as e:
-        print(f"pikepdf normalize failed: {e}, using raw bytes")
-        return raw_bytes
-
-
 def compress_with_pikepdf(raw_bytes: bytes) -> bytes:
+    # Guard: only attempt if bytes start with PDF magic bytes
+    if not raw_bytes.startswith(b"%PDF"):
+        print("compress_with_pikepdf skipped: not a PDF")
+        return raw_bytes
     try:
         buf = io.BytesIO()
         with pikepdf.open(io.BytesIO(raw_bytes)) as pdf:
@@ -44,6 +35,22 @@ def compress_with_pikepdf(raw_bytes: bytes) -> bytes:
         return buf.read()
     except Exception as e:
         print(f"pikepdf compression failed: {e}, using raw bytes")
+        return raw_bytes
+
+
+def normalize_pdf_bytes(raw_bytes: bytes) -> bytes:
+    # Guard: only attempt if bytes start with PDF magic bytes
+    if not raw_bytes.startswith(b"%PDF"):
+        print("normalize_pdf_bytes skipped: not a PDF")
+        return raw_bytes
+    try:
+        buf = io.BytesIO()
+        with pikepdf.open(io.BytesIO(raw_bytes), allow_overwriting_input=False) as pdf:
+            pdf.save(buf, encryption=False)
+        buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        print(f"pikepdf normalize failed: {e}, using raw bytes")
         return raw_bytes
 
 

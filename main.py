@@ -1,17 +1,17 @@
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import List
 import tempfile, shutil, os, json, base64, io
 from PyPDF2 import PdfReader, PdfWriter
 import pikepdf
+from PIL import Image
+import img2pdf
 
 app = FastAPI()
 
 
 def open_pdf_reader(data: bytes) -> PdfReader:
-    """
-    Open a PdfReader, handling encrypted/signed PDFs by attempting
-    decryption with an empty password (standard for digitally signed docs).
-    """
     reader = PdfReader(io.BytesIO(data))
     if reader.is_encrypted:
         try:
@@ -24,15 +24,9 @@ def open_pdf_reader(data: bytes) -> PdfReader:
 
 
 def normalize_pdf_bytes(raw_bytes: bytes) -> bytes:
-    """
-    Use pikepdf to normalize (and optionally decompress) a PDF.
-    This strips encryption/signatures so PyPDF2 can safely read it.
-    Falls back to raw bytes if pikepdf fails.
-    """
     try:
         buf = io.BytesIO()
         with pikepdf.open(io.BytesIO(raw_bytes), allow_overwriting_input=False) as pdf:
-            # Save without encryption — removes signing wrapper too
             pdf.save(buf, encryption=False)
         buf.seek(0)
         return buf.read()
@@ -42,7 +36,6 @@ def normalize_pdf_bytes(raw_bytes: bytes) -> bytes:
 
 
 def compress_with_pikepdf(raw_bytes: bytes) -> bytes:
-    """Compress PDF bytes with pikepdf, fall back to raw on error."""
     try:
         buf = io.BytesIO()
         with pikepdf.open(io.BytesIO(raw_bytes)) as pdf:
@@ -58,6 +51,26 @@ def read_upload(file: UploadFile) -> bytes:
     return file.file.read()
 
 
+def image_to_pdf_bytes(raw: bytes) -> bytes:
+    image = Image.open(io.BytesIO(raw))
+
+    if image.mode in ("RGBA", "P", "LA"):
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        if image.mode == "P":
+            image = image.convert("RGBA")
+        background.paste(image, mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None)
+        image = background
+    elif image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+
+    img_buffer = io.BytesIO()
+    fmt = "JPEG" if image.mode == "RGB" else "PNG"
+    image.save(img_buffer, format=fmt)
+    img_buffer.seek(0)
+
+    return img2pdf.convert(img_buffer.getvalue())
+
+
 @app.post("/split-pdf")
 async def split_pdf(file: UploadFile = File(...), config_json: str = Form(...)):
     try:
@@ -66,7 +79,6 @@ async def split_pdf(file: UploadFile = File(...), config_json: str = Form(...)):
         return {"error": f"Invalid JSON: {str(e)}"}
 
     raw = read_upload(file)
-    # Normalize first — strips encryption/signing so PyPDF2 works cleanly
     normalized = normalize_pdf_bytes(raw)
 
     result_files = []
@@ -134,9 +146,16 @@ async def split_page_page(file: UploadFile = File(...)):
                     "data": encoded
                 })
 
-        elif filename.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff")):
-            encoded = base64.b64encode(raw).decode("utf-8")
-            result_files.append({"filename": filename, "data": encoded})
+        elif filename.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")):
+            pdf_bytes = image_to_pdf_bytes(raw)
+            final_bytes = compress_with_pikepdf(pdf_bytes)
+            stem = filename.rsplit(".", 1)[0]
+            encoded = base64.b64encode(final_bytes).decode("utf-8")
+
+            result_files.append({
+                "filename": f"{stem}.pdf",
+                "data": encoded
+            })
 
         else:
             return JSONResponse(content={"error": "Unsupported file type"}, status_code=400)
@@ -149,13 +168,9 @@ async def split_page_page(file: UploadFile = File(...)):
     return JSONResponse(content=result_files)
 
 
-from pydantic import BaseModel
-from typing import List
-
-
 class DocumentItem(BaseModel):
     name: str
-    data: str  # base64-encoded PDF
+    data: str
 
 
 class MergePackage(BaseModel):

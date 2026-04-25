@@ -6,6 +6,55 @@ import pikepdf
 
 app = FastAPI()
 
+
+def normalize_pdf(input_path: str) -> bytes:
+    """
+    Use pikepdf to open and re-save a PDF, stripping encryption/signatures
+    so that PyPDF2 can process it cleanly afterward.
+
+    For digitally signed PDFs, pikepdf opens them without enforcing signature
+    validity, and saving produces a clean, unencrypted copy.
+    For password-protected PDFs with an empty owner password (common for
+    'permissions-only' encrypted docs), pikepdf unlocks them automatically.
+    """
+    buf = io.BytesIO()
+    with pikepdf.open(input_path, suppress_warnings=True) as pdf:
+        # Save without encryption — drops digital signatures and any
+        # restrictions while keeping all page content intact.
+        pdf.save(buf, encryption=False)
+    buf.seek(0)
+    return buf.read()
+
+
+def extract_pages_as_pdf(normalized_bytes: bytes, start: int, end: int) -> bytes:
+    """
+    Extract pages [start, end) (0-indexed) from normalized PDF bytes
+    and return the resulting PDF as bytes.
+    """
+    reader = PdfReader(io.BytesIO(normalized_bytes))
+    writer = PdfWriter()
+    for i in range(start, end):
+        writer.add_page(reader.pages[i])
+
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    return out.read()
+
+
+def compress_pdf_bytes(raw_bytes: bytes) -> bytes:
+    """Run pikepdf compression on PDF bytes; fall back to raw on failure."""
+    try:
+        buf = io.BytesIO()
+        with pikepdf.open(io.BytesIO(raw_bytes)) as pdf:
+            pdf.save(buf)
+        buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        print(f"pikepdf compression failed: {e}, using raw bytes")
+        return raw_bytes
+
+
 @app.post("/split-pdf")
 async def split_pdf(file: UploadFile = File(...), config_json: str = Form(...)):
     try:
@@ -20,44 +69,36 @@ async def split_pdf(file: UploadFile = File(...), config_json: str = Form(...)):
 
     result_files = []
     try:
-        with open(temp_input.name, "rb") as f_in:
-            reader = PdfReader(f_in)
-            total_pages = len(reader.pages)
+        # Normalize first: handles signed, encrypted, and standard PDFs uniformly
+        try:
+            normalized = normalize_pdf(temp_input.name)
+        except pikepdf.PasswordError:
+            return JSONResponse(
+                content={"error": "PDF is password-protected and cannot be opened without a password."},
+                status_code=400,
+            )
+        except Exception as e:
+            return JSONResponse(content={"error": f"Failed to open PDF: {str(e)}"}, status_code=400)
 
-            for item in config:
-                start = item.get("start_page", 1) - 1
-                end = item.get("end_page", total_pages)
+        # Determine total pages from normalized bytes
+        reader = PdfReader(io.BytesIO(normalized))
+        total_pages = len(reader.pages)
 
-                if start < 0 or end > total_pages or start >= end:
-                    return {"error": f"Invalid page range for {item.get('filename')}"}
+        for item in config:
+            start = item.get("start_page", 1) - 1
+            end = item.get("end_page", total_pages)
 
-                writer = PdfWriter()
-                for i in range(start, end):
-                    writer.add_page(reader.pages[i])
+            if start < 0 or end > total_pages or start >= end:
+                return JSONResponse(
+                    content={"error": f"Invalid page range for {item.get('filename')}"},
+                    status_code=400,
+                )
 
-                # Write to BytesIO first to avoid any file handle issues
-                pdf_buffer = io.BytesIO()
-                writer.write(pdf_buffer)
-                pdf_buffer.seek(0)
-                raw_bytes = pdf_buffer.read()
+            raw_bytes = extract_pages_as_pdf(normalized, start, end)
+            final_bytes = compress_pdf_bytes(raw_bytes)
 
-                # Optional: compress with pikepdf using in-memory bytes
-                try:
-                    compressed_buffer = io.BytesIO()
-                    with pikepdf.open(io.BytesIO(raw_bytes)) as pdf:
-                        pdf.save(compressed_buffer)
-                    compressed_buffer.seek(0)
-                    final_bytes = compressed_buffer.read()
-                except Exception as e:
-                    # Fall back to uncompressed if pikepdf fails
-                    print(f"pikepdf compression failed: {e}, using raw bytes")
-                    final_bytes = raw_bytes
-
-                encoded = base64.b64encode(final_bytes).decode("utf-8")
-                result_files.append({
-                    "filename": item["filename"],
-                    "data": encoded
-                })
+            encoded = base64.b64encode(final_bytes).decode("utf-8")
+            result_files.append({"filename": item["filename"], "data": encoded})
 
     finally:
         os.unlink(temp_input.name)
@@ -70,52 +111,39 @@ async def split_page_page(file: UploadFile = File(...)):
     filename = file.filename.lower()
     result_files = []
 
-    # Save uploaded file to a temp file
     temp_input = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1])
     temp_input.close()
     with open(temp_input.name, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
     try:
-        # If PDF, split page by page
         if filename.endswith(".pdf"):
-            with open(temp_input.name, "rb") as f_in:
-                reader = PdfReader(f_in)
-                total_pages = len(reader.pages)
-                for i in range(total_pages):
-                    writer = PdfWriter()
-                    writer.add_page(reader.pages[i])
+            # Normalize: handles signed, AES-encrypted, and standard PDFs
+            try:
+                normalized = normalize_pdf(temp_input.name)
+            except pikepdf.PasswordError:
+                return JSONResponse(
+                    content={"error": "PDF is password-protected and cannot be opened without a password."},
+                    status_code=400,
+                )
+            except Exception as e:
+                return JSONResponse(content={"error": f"Failed to open PDF: {str(e)}"}, status_code=400)
 
-                    pdf_buffer = io.BytesIO()
-                    writer.write(pdf_buffer)
-                    pdf_buffer.seek(0)
+            reader = PdfReader(io.BytesIO(normalized))
+            total_pages = len(reader.pages)
 
-                    # Compress using pikepdf (optional)
-                    try:
-                        compressed_buffer = io.BytesIO()
-                        with pikepdf.open(pdf_buffer) as pdf:
-                            pdf.save(compressed_buffer)
-                        compressed_buffer.seek(0)
-                        final_bytes = compressed_buffer.read()
-                    except Exception as e:
-                        print(f"pikepdf compression failed: {e}, using raw bytes")
-                        pdf_buffer.seek(0)
-                        final_bytes = pdf_buffer.read()
+            for i in range(total_pages):
+                raw_bytes = extract_pages_as_pdf(normalized, i, i + 1)
+                final_bytes = compress_pdf_bytes(raw_bytes)
 
-                    encoded = base64.b64encode(final_bytes).decode("utf-8")
-                    result_files.append({
-                        "filename": f"page_{i+1}.pdf",
-                        "data": encoded
-                    })
+                encoded = base64.b64encode(final_bytes).decode("utf-8")
+                result_files.append({"filename": f"page_{i+1}.pdf", "data": encoded})
 
-        # If image, just return original image as single "page"
         elif filename.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff")):
             with open(temp_input.name, "rb") as img_file:
                 encoded = base64.b64encode(img_file.read()).decode("utf-8")
-            result_files.append({
-                "filename": filename,
-                "data": encoded
-            })
+            result_files.append({"filename": filename, "data": encoded})
+
         else:
             return JSONResponse(content={"error": "Unsupported file type"}, status_code=400)
 
@@ -123,57 +151,3 @@ async def split_page_page(file: UploadFile = File(...)):
         os.unlink(temp_input.name)
 
     return JSONResponse(content=result_files)
-
-
-from pydantic import BaseModel
-from typing import List
-
-class DocumentItem(BaseModel):
-    name: str
-    data: str  # base64-encoded PDF
-
-class MergePackage(BaseModel):
-    package_name: str
-    documents: List[DocumentItem]
-
-
-@app.post("/merge-files")
-async def merge_files(payload: MergePackage):
-    writer = PdfWriter()
-
-    for doc in payload.documents:
-        try:
-            raw_bytes = base64.b64decode(doc.data)
-            reader = PdfReader(io.BytesIO(raw_bytes))
-            for page in reader.pages:
-                writer.add_page(page)
-        except Exception as e:
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"Failed to process '{doc.name}': {str(e)}"}
-            )
-
-    # Write merged PDF to buffer
-    merged_buffer = io.BytesIO()
-    writer.write(merged_buffer)
-    merged_buffer.seek(0)
-
-    # Optional: compress with pikepdf
-    try:
-        compressed_buffer = io.BytesIO()
-        with pikepdf.open(merged_buffer) as pdf:
-            pdf.save(compressed_buffer)
-        compressed_buffer.seek(0)
-        final_bytes = compressed_buffer.read()
-    except Exception as e:
-        print(f"pikepdf compression failed: {e}, using raw bytes")
-        merged_buffer.seek(0)
-        final_bytes = merged_buffer.read()
-
-    encoded = base64.b64encode(final_bytes).decode("utf-8")
-
-    return JSONResponse(content={
-        "package_name": payload.package_name,
-        "filename": f"{payload.package_name}.pdf",
-        "data": encoded
-    })
